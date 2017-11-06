@@ -1,0 +1,38 @@
+<Project>
+
+  <PropertyGroup>
+    <TestProject>False</TestProject>
+    <TestProject Condition="$(AssemblyName.Contains('Tests'))">True</TestProject>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <GenerateAssemblyInfo>True</GenerateAssemblyInfo>
+    <RootNamespace Condition="!$(TestProject)">$(AssemblyName)</RootNamespace>
+    <RootNamespace Condition="$(TestProject)">$(AssemblyName.Replace('.Tests', ''))</RootNamespace>
+
+    <Version>0.0.1.0</Version>
+    <Title>$(AssemblyName)</Title>
+
+    <LangVersion>7.1</LangVersion>
+
+    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
+    <GenerateBindingRedirectsOutputType>true</GenerateBindingRedirectsOutputType>
+    <PreserveCompilationContext>true</PreserveCompilationContext>
+  </PropertyGroup>
+  
+  <ItemGroup>
+    <PackageReference Include="JetBrains.Annotations" Version="11.0.0" PrivateAssets="All" />
+  </ItemGroup>
+
+  <ItemGroup Condition="$(TestProject)">
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="15.3.0" />
+    <PackageReference Include="Moq" Version="4.7.99" />
+    <PackageReference Include="NUnit" Version="3.8.1" />
+    <PackageReference Include="NUnit3TestAdapter" Version="3.8.0" />
+  </ItemGroup>
+
+  <PropertyGroup Condition="$(TestProject)">
+    <UserSecretsId>$(AssemblyName)</UserSecretsId>
+    <DotNetCliToolReference Include="Microsoft.Extensions.SecretManager.Tools" Version="2.0.0" />
+  </PropertyGroup>
+</Project>
