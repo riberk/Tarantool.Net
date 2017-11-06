@@ -1,4 +1,4 @@
-﻿namespace Tarantool.Net.Abstractions
+﻿namespace Tarantool.Net.Driver
 {
     ///<summary>
     /// <see href="https://github.com/tarantool/tarantool/blob/1.7/src/box/iterator_type.h">

@@ -1,13 +1,13 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>netstandard2.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>netcoreapp2.0</TargetFramework>
   </PropertyGroup>
-  <Import Project="../Common.Props" />
-  <ItemGroup>
-    <PackageReference Include="MsgPack.Cli" Version="1.0.0-beta2" />
-  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\Tarantool.Net.Driver\Tarantool.Net.Driver.csproj" />
+    <ProjectReference Include="..\Tarantool.Net.MessagePackCli\Tarantool.Net.MessagePackCli.csproj" />
   </ItemGroup>
+
 </Project>

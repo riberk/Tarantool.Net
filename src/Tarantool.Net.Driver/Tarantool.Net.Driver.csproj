@@ -7,7 +7,4 @@
   <ItemGroup>
     <PackageReference Include="System.Interactive.Async" Version="3.1.1" />
   </ItemGroup>
-  <ItemGroup>
-    <ProjectReference Include="..\Tarantool.Net.Abstractions\Tarantool.Net.Abstractions.csproj" />
-  </ItemGroup>
 </Project>

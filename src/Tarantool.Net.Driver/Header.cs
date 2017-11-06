@@ -1,4 +1,4 @@
-﻿namespace Tarantool.Net.Abstractions
+﻿namespace Tarantool.Net.Driver
 {
     public struct Header
     {

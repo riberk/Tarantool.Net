@@ -1,118 +1,53 @@
 ﻿using System;
-using System.Threading.Tasks;
-using System.Collections.Generic;
-using System.Threading;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.IO;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using JetBrains.Annotations;
-using Tarantool.Net.Abstractions;
-using Tarantool.Net.Abstractions.Serialization;
+using Tarantool.Net.Driver.Serialization;
 
 namespace Tarantool.Net.Driver
 {
-    public class TarantoolConnectionOptions
-    {
-        public TarantoolConnectionOptions(string host, int port)
-        {
-            Host = host ?? throw new ArgumentNullException(nameof(host));
-            Port = port;
-        }
-
-        public TarantoolConnectionOptions(string host, int port, string userName, string password)
-        {
-            Host = host ?? throw new ArgumentNullException(nameof(host));
-            Port = port;
-            UserName = userName ?? throw new ArgumentNullException(nameof(userName));
-            Password = password ?? throw new ArgumentNullException(nameof(password));
-        }
-
-        public string Host { get; }
-
-        public int Port { get; }
-
-        public string UserName { get; }
-
-        public string Password { get; }
-    }
-
-    public class TarantoolConnectionStringBuilder
-    {
-        
-    }
-
-    public class StdResolver : ISerializerResolver, IDeserializerResolver
-    {
-        [NotNull] private readonly Dictionary<Type, object> _serializers = new Dictionary<Type, object>();
-        [NotNull] private readonly Dictionary<Type, object> _deserializers = new Dictionary<Type, object>();
-
-        public StdResolver(
-            ISerializer<Header> headerSerializer,
-            ISerializer<int> intSerializer,
-            IDeserializer<Header> headerDeserializer,
-            IDeserializer<int> intDeserializer,
-            IDeserializer<ErrorResponse> errorResponseDeserializer
-            )
-        {
-            Add(headerSerializer);
-            Add(intSerializer);
-            Add(headerDeserializer);
-            Add(intDeserializer);
-            Add(errorResponseDeserializer);
-        }
-
-        private void Add<T>(ISerializer<T> serializer)
-        {
-            _serializers.Add(typeof(T), serializer);
-        }
-
-        private void Add<T>(IDeserializer<T> serializer)
-        {
-            _deserializers.Add(typeof(T), serializer);
-        }
-
-        ISerializer<T> ISerializerResolver.Resolve<T>()
-        {
-            var type = typeof(T);
-            if (!_serializers.TryGetValue(type, out var s))
-            {
-                throw new KeyNotFoundException($"Serializer for {type} not registred");
-            }
-            return (ISerializer<T>) s;
-        }
-
-        IDeserializer<T> IDeserializerResolver.Resolve<T>()
-        {
-            var type = typeof(T);
-            if (!_deserializers.TryGetValue(type, out var s))
-            {
-                throw new KeyNotFoundException($"Deserializer for {type} not registred");
-            }
-            return (IDeserializer<T>)s;
-        }
-    }
-
     public class BinaryConnection : IBinaryConnection
     {
-        [NotNull] private readonly ISerializerResolver _serializerResolver;
+        [NotNull] private readonly ConcurrentDictionary<ulong, TaskCompletionSource<ResponseContinuationResult>> _continuations =
+            new ConcurrentDictionary<ulong, TaskCompletionSource<ResponseContinuationResult>>();
+
         [NotNull] private readonly IDeserializerResolver _deserializerResolver;
+        [NotNull] private readonly byte[] _emptyBuffer;
+        [NotNull] private readonly IDeserializer<ErrorResponse> _errorDeserializer;
+        [NotNull] private readonly IDeserializer<Header> _headerDeserializer;
+        [NotNull] private readonly ISerializer<Header> _headerSerializer;
+
+        [NotNull] private readonly SemaphoreSlim _readerSemaphore;
+        [NotNull] private readonly byte[] _readSizeEmptyBuffer;
+        [NotNull] private readonly StreamInformer _readStream;
+        [NotNull] private readonly ISerializerResolver _serializerResolver;
+        [NotNull] private readonly IDeserializer<int> _sizeDeserializer;
+        [NotNull] private readonly ISerializer<int> _sizeSerializer;
         [NotNull] private readonly Socket _socket;
-        [NotNull] private readonly NetworkStream _writeStream;
-        [NotNull] private readonly BufferedStream _readStream;
-        private bool _isConnected = false;
-        private bool _isAuthenticated = false;
+        [NotNull] private readonly SemaphoreSlim _writerSemaphore;
+        [NotNull] private readonly Stream _writeStream;
+        private bool _isAuthenticated;
+        private bool _isConnected;
+
+        private long _syncCounter;
+        [NotNull] private readonly NetworkStream _networkStream;
 
         public BinaryConnection(
                 [NotNull] ISerializerResolver serializerResolver,
                 [NotNull] IDeserializerResolver deserializerResolver
-        )
+            )
         {
             _serializerResolver = serializerResolver ?? throw new ArgumentNullException(nameof(serializerResolver));
             _deserializerResolver = deserializerResolver ?? throw new ArgumentNullException(nameof(deserializerResolver));
             _socket = new Socket(SocketType.Stream, ProtocolType.IP);
-            _writeStream = new NetworkStream(_socket, true);
+            _networkStream = new NetworkStream(_socket, true);
+            _writeStream =_networkStream;
             _readerSemaphore = new SemaphoreSlim(1);
             _writerSemaphore = new SemaphoreSlim(1);
             _headerSerializer = serializerResolver.Resolve<Header>();
@@ -120,9 +55,11 @@ namespace Tarantool.Net.Driver
             _sizeSerializer = serializerResolver.Resolve<int>();
             _sizeDeserializer = deserializerResolver.Resolve<int>();
             _errorDeserializer = _deserializerResolver.Resolve<ErrorResponse>();
-            _emptyBuffer = new byte[1024*16];
-            _readStream = new BufferedStream(_writeStream, 1024*16);
+            _emptyBuffer = new byte[1024 * 16];
+            _readSizeEmptyBuffer = new byte[8];
+            _readStream = new StreamInformer(new BufferedStream(_networkStream, 1024 * 16));
         }
+
         public ConnectionInfo ConnectionInfo { get; private set; }
         public AuthenticationInfo AuthenticationInfo { get; private set; }
 
@@ -141,32 +78,6 @@ namespace Tarantool.Net.Driver
             _isConnected = true;
             ReadPacketAsync().FireAndForget();
             return ConnectionInfo;
-        }
-
-        private async Task ReadPacketAsync()
-        {
-            await _readerSemaphore.WaitAsync();
-            try
-            {
-                var sizePacket = await _sizeDeserializer.DeserializeAsync(_writeStream, CancellationToken.None);
-                if (sizePacket.DeserializedBytes < 5)
-                {
-                    await _readStream.ReadAsync(_readSizeEmptyBuffer, 0, 5 - sizePacket.DeserializedBytes);
-                }
-                var fullSize = sizePacket.Value;
-                var header = await _headerDeserializer.DeserializeAsync(_writeStream, CancellationToken.None);
-                var result = new ResponseContinuationResult(fullSize, header.DeserializedBytes, header.Value, _readerSemaphore);
-                if (_continuations.TryGetValue(header.Value.Sync, out var cts))
-                {
-                    cts.SetResult(result);
-                }
-            }
-            catch
-            {
-                //TODO exception
-                _readerSemaphore.Release();
-            }
-            
         }
 
         public async Task<AuthenticationInfo> AuthenticateAsync(string userName, string password, CancellationToken ct)
@@ -188,9 +99,9 @@ namespace Tarantool.Net.Driver
                 Array.Copy(step2, 0, buffer, 20, 20);
                 var step3 = sha1.ComputeHash(buffer);
 
-                for (int i = 0; i < step1.Length; i++)
+                for (var i = 0; i < step1.Length; i++)
                 {
-                    buffer[i] = (byte)(step1[i] ^ step3[i]);
+                    buffer[i] = (byte) (step1[i] ^ step3[i]);
                 }
             }
             var authenticationInfo = new AuthenticationInfo(userName, buffer);
@@ -204,12 +115,50 @@ namespace Tarantool.Net.Driver
             return AuthenticationInfo;
         }
 
+        public Task<IAsyncEnumerable<TResult>> Select<TKey, TResult>(ISelectRequest<TKey> request, CancellationToken ct)
+        {
+            throw new NotImplementedException();
+        }
+
+        public void Dispose()
+        {
+            _networkStream?.Dispose();
+            _socket?.Dispose();
+        }
+
+        private async Task ReadPacketAsync()
+        {
+            await _readerSemaphore.WaitAsync();
+            try
+            {
+                _readStream.ClearState();
+                var sizePacket = await _sizeDeserializer.DeserializeAsync(_readStream, CancellationToken.None);
+                if (_readStream.ReadedBytes < 5)
+                {
+                    await _readStream.ReadAsync(_readSizeEmptyBuffer, 0, 5 - _readStream.ReadedBytes);
+                }
+                var fullSize = sizePacket;
+                var header = await _headerDeserializer.DeserializeAsync(_readStream, CancellationToken.None);
+                var headerSize = _readStream.ReadedBytes - 5;
+                var result = new ResponseContinuationResult(fullSize, headerSize, header, _readerSemaphore);
+                if (_continuations.TryGetValue(header.Sync, out var cts))
+                {
+                    cts.SetResult(result);
+                }
+            }
+            catch
+            {
+                //TODO exception
+                _readerSemaphore.Release();
+            }
+        }
+
         private async Task EnsureSuccessResponse(ResponseContinuationResult result, CancellationToken ct)
         {
             if (result.Header.ErrorCode.HasValue)
             {
-                var tarantoolError = await _errorDeserializer.DeserializeAsync(_writeStream, ct);
-                throw new TarantoolException(result.Header.ErrorCode.Value, tarantoolError.Value.Message);
+                var tarantoolError = await _errorDeserializer.DeserializeAsync(_readStream, ct);
+                throw new TarantoolException(result.Header.ErrorCode.Value, tarantoolError.Message);
             }
         }
 
@@ -222,6 +171,7 @@ namespace Tarantool.Net.Driver
                 unreaded -= await _readStream.ReadAsync(_emptyBuffer, 0, needReadBytes);
             }
         }
+
         private async Task ReadResponse(ResponseContinuationResult result, CancellationToken ct)
         {
             await EnsureSuccessResponse(result, ct);
@@ -231,12 +181,19 @@ namespace Tarantool.Net.Driver
         private async Task<T> ReadResponse<T>(ResponseContinuationResult result, CancellationToken ct)
         {
             await EnsureSuccessResponse(result, ct);
-            var res = await _deserializerResolver.Resolve<T>().DeserializeAsync(_writeStream, ct);
-            return res.Value;
+            var beforeBytesReaded = _readStream.ReadedBytes;
+            var res = await _deserializerResolver.Resolve<T>().DeserializeAsync(_readStream, ct);
+            
+            await ReadToEndResponse(result, _readStream.ReadedBytes - beforeBytesReaded, ct);
+            return res;
         }
 
         [ItemNotNull]
-        private async Task<Task<ResponseContinuationResult>> SendRequestAsync<TRequest>(RequestType requestType, uint? schemaId, TRequest request, CancellationToken ct)
+        private async Task<Task<ResponseContinuationResult>> SendRequestAsync<TRequest>(
+            RequestType requestType,
+            uint? schemaId,
+            TRequest request,
+            CancellationToken ct)
         {
             var sync = NextSync();
             var responseTask = GetResponseTask(sync);
@@ -244,54 +201,30 @@ namespace Tarantool.Net.Driver
             var buffer = new byte[5 + 13];
             var bufferStream = new MemoryStream(buffer);
             bufferStream.Seek(5, SeekOrigin.Begin);
-            var headerBytes = await _headerSerializer.SerializeAsync(bufferStream, header, ct).ConfigureAwait(false);
-            var bodyBytes = await _serializerResolver.Resolve<TRequest>().SerializeAsync(bufferStream, request, ct).ConfigureAwait(false);
-            await _sizeSerializer.SerializeAsync(bufferStream, headerBytes + bodyBytes, ct).ConfigureAwait(false);
+            await _headerSerializer.SerializeAsync(bufferStream, header, ct).ConfigureAwait(false);
+            await _serializerResolver.Resolve<TRequest>().SerializeAsync(bufferStream, request, ct).ConfigureAwait(false);
+            var headerAndBodySize = (int)bufferStream.Position - 5;
+            bufferStream.Position = 0;
+            await _sizeSerializer.SerializeAsync(bufferStream, headerAndBodySize, ct).ConfigureAwait(false);
 
-            await _readerSemaphore.WaitAsync(ct).ConfigureAwait(false);
+            await _writerSemaphore.WaitAsync(ct).ConfigureAwait(false);
             bufferStream.Position = 0;
             try
             {
-                await _writeStream.WriteAsync(buffer, 0, 5 + headerBytes + bodyBytes, ct).ConfigureAwait(false);
+                await _writeStream.WriteAsync(buffer, 0, (int)bufferStream.Length, ct).ConfigureAwait(false);
             }
             finally
             {
-                _readerSemaphore.Release();
+                _writerSemaphore.Release();
             }
             return responseTask;
         }
-
-        public Task<IAsyncEnumerable<TResult>> Select<TKey, TResult>(ISelectRequest<TKey> request, CancellationToken ct)
-        {
-            throw new NotImplementedException();
-        }
-
-        public void Dispose()
-        {
-            _writeStream?.Dispose();
-            _socket?.Dispose();
-        }
-
-        private long _syncCounter = 0;
 
         public ulong NextSync()
         {
             Interlocked.Increment(ref _syncCounter);
             return (ulong) _syncCounter;
         }
-
-        [NotNull] private readonly ConcurrentDictionary<ulong, TaskCompletionSource<ResponseContinuationResult>> _continuations =
-            new ConcurrentDictionary<ulong, TaskCompletionSource<ResponseContinuationResult>>();
-
-        [NotNull] private readonly SemaphoreSlim _readerSemaphore;
-        [NotNull] private readonly ISerializer<Header> _headerSerializer;
-        [NotNull] private readonly ISerializer<int> _sizeSerializer;
-        [NotNull] private readonly IDeserializer<ErrorResponse> _errorDeserializer;
-        [NotNull] private readonly byte[] _emptyBuffer;
-        [NotNull] private readonly IDeserializer<Header> _headerDeserializer;
-        [NotNull] private readonly IDeserializer<int> _sizeDeserializer;
-        [NotNull] private readonly byte[] _readSizeEmptyBuffer;
-        [NotNull] private readonly SemaphoreSlim _writerSemaphore;
 
         private Task<ResponseContinuationResult> GetResponseTask(ulong sync)
         {
@@ -303,7 +236,7 @@ namespace Tarantool.Net.Driver
             return cs.Task;
         }
 
-        private struct ResponseContinuationResult  : IDisposable
+        private struct ResponseContinuationResult : IDisposable
         {
             [NotNull] private readonly SemaphoreSlim _semaphore;
 
@@ -311,18 +244,12 @@ namespace Tarantool.Net.Driver
                 int fullSize,
                 int headerSize,
                 Header header,
-                [NotNull] SemaphoreSlim semaphore) 
+                [NotNull] SemaphoreSlim semaphore)
             {
                 _semaphore = semaphore ?? throw new ArgumentNullException(nameof(semaphore));
-                FullSize = fullSize;
-                HeaderSize = headerSize;
                 Header = header;
-                BodySize = FullSize - headerSize;
+                BodySize = fullSize - headerSize;
             }
-
-            public int FullSize { get; }
-
-            public int HeaderSize { get; }
 
             public Header Header { get; }
 
@@ -333,123 +260,5 @@ namespace Tarantool.Net.Driver
                 _semaphore.Release();
             }
         }
-    }
-
-    public class TarantoolException : Exception
-    {
-        public ErrorCode ErrorCode { get; }
-
-        public string TarantoolMessage { get; }
-
-        public TarantoolException(ErrorCode errorCode, string tarantoolMessage)
-            : base($"Tarantool response error \nCode: {errorCode}\nMessage: {tarantoolMessage}")
-        {
-            ErrorCode = errorCode;
-            TarantoolMessage = tarantoolMessage;
-        }
-
-    }
-    public interface ISerializerResolver
-    {
-        [NotNull]
-        ISerializer<T> Resolve<T>();
-    }
-
-    public interface IDeserializerResolver
-    {
-        [NotNull]
-        IDeserializer<T> Resolve<T>();
-    }
-
-    public interface IResponseReader
-    {
-        Task WaitNext();
-    }
-    
-    public interface IBinaryConnection : IDisposable
-    {
-        ConnectionInfo ConnectionInfo { get; }
-
-        AuthenticationInfo AuthenticationInfo { get; }
-
-        Task<ConnectionInfo> OpenAsync(string host, int port);
-
-        Task<AuthenticationInfo> AuthenticateAsync(string userName, string password, CancellationToken ct);
-
-        Task<IAsyncEnumerable<TResult>> Select<TKey, TResult>(ISelectRequest<TKey> request, CancellationToken ct);
-    }
-
-    public interface ISelectRequest<out TKey>
-    {
-        uint SpaceId { get; }
-
-        uint IndexId { get; }
-
-        uint? Limit { get; }
-
-        uint? Offset { get; }
-
-        IteratorType Iterator { get; }
-
-        TKey Key { get; }
-    }
-
-    public struct SelectRequest<TKey>  : ISelectRequest<TKey>
-    {
-        public SelectRequest(uint spaceId, uint indexId, uint? limit, uint? offset, IteratorType iterator, TKey key)
-        {
-            SpaceId = spaceId;
-            IndexId = indexId;
-            Limit = limit;
-            Offset = offset;
-            Iterator = iterator;
-            Key = key;
-        }
-
-        public uint SpaceId { get; }
-        public uint IndexId { get; }
-        public uint? Limit { get; }
-        public uint? Offset { get; }
-        public IteratorType Iterator { get; }
-        public TKey Key { get; }
-    }
-
-    public struct ErrorResponse
-    {
-        public ErrorResponse(string message)
-        {
-            Message = message;
-        }
-
-        public string Message { get; }
-    }
-
-    public struct AuthenticationInfo
-    {
-        /// <summary>Initializes a new instance of the <see cref="T:System.Object"></see> class.</summary>
-        public AuthenticationInfo(string userName, byte[] chapSha1)
-        {
-            UserName = userName ?? throw new ArgumentNullException(nameof(userName));
-            ChapSha1 = chapSha1 ?? throw new ArgumentNullException(nameof(chapSha1));
-        }
-
-        public string UserName { get; }
-
-        public byte[] ChapSha1 { get; }
-    }
-
-    public struct ConnectionInfo
-    {
-        /// <summary>Initializes a new instance of the <see cref="T:System.Object"></see> class.</summary>
-        public ConnectionInfo(string version, byte[] salt)
-        {
-            Version = version ?? throw new ArgumentNullException(nameof(version));
-            Salt = salt ?? throw new ArgumentNullException(nameof(salt));
-        }
-
-        public string Version { get; }
-
-        public byte[] Salt { get; }
-
     }
 }
