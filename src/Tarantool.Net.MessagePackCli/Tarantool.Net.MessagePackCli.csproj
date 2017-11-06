@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+  </PropertyGroup>
+  <Import Project="../Common.Props" />
+  <ItemGroup>
+    <ProjectReference Include="..\Tarantool.Net.Abstractions\Tarantool.Net.Abstractions.csproj" />
+  </ItemGroup>
+</Project>
