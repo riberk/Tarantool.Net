@@ -51,12 +51,26 @@ namespace Tarantool.Net.Driver
         public StdResolver(
             ISerializer<Header> headerSerializer,
             ISerializer<int> intSerializer,
-            IDeserializer<ErrorResponse> errorResponse
+            IDeserializer<Header> headerDeserializer,
+            IDeserializer<int> intDeserializer,
+            IDeserializer<ErrorResponse> errorResponseDeserializer
             )
         {
-            _serializers.Add(typeof(Header), headerSerializer);
-            _serializers.Add(typeof(int), intSerializer);
-            _deserializers.Add(typeof(ErrorResponse), errorResponse);
+            Add(headerSerializer);
+            Add(intSerializer);
+            Add(headerDeserializer);
+            Add(intDeserializer);
+            Add(errorResponseDeserializer);
+        }
+
+        private void Add<T>(ISerializer<T> serializer)
+        {
+            _serializers.Add(typeof(T), serializer);
+        }
+
+        private void Add<T>(IDeserializer<T> serializer)
+        {
+            _deserializers.Add(typeof(T), serializer);
         }
 
         ISerializer<T> ISerializerResolver.Resolve<T>()
@@ -85,7 +99,8 @@ namespace Tarantool.Net.Driver
         [NotNull] private readonly ISerializerResolver _serializerResolver;
         [NotNull] private readonly IDeserializerResolver _deserializerResolver;
         [NotNull] private readonly Socket _socket;
-        [NotNull] private readonly NetworkStream _stream;
+        [NotNull] private readonly NetworkStream _writeStream;
+        [NotNull] private readonly BufferedStream _readStream;
         private bool _isConnected = false;
         private bool _isAuthenticated = false;
 
@@ -97,12 +112,16 @@ namespace Tarantool.Net.Driver
             _serializerResolver = serializerResolver ?? throw new ArgumentNullException(nameof(serializerResolver));
             _deserializerResolver = deserializerResolver ?? throw new ArgumentNullException(nameof(deserializerResolver));
             _socket = new Socket(SocketType.Stream, ProtocolType.IP);
-            _stream = new NetworkStream(_socket, true);
-            _semaphore = new SemaphoreSlim(1);
+            _writeStream = new NetworkStream(_socket, true);
+            _readerSemaphore = new SemaphoreSlim(1);
+            _writerSemaphore = new SemaphoreSlim(1);
             _headerSerializer = serializerResolver.Resolve<Header>();
+            _headerDeserializer = deserializerResolver.Resolve<Header>();
             _sizeSerializer = serializerResolver.Resolve<int>();
+            _sizeDeserializer = deserializerResolver.Resolve<int>();
             _errorDeserializer = _deserializerResolver.Resolve<ErrorResponse>();
-            _emptyBuffer = new byte[4096];
+            _emptyBuffer = new byte[1024*16];
+            _readStream = new BufferedStream(_writeStream, 1024*16);
         }
         public ConnectionInfo ConnectionInfo { get; private set; }
         public AuthenticationInfo AuthenticationInfo { get; private set; }
@@ -120,7 +139,34 @@ namespace Tarantool.Net.Driver
             var salt = Convert.FromBase64String(saltBase64);
             ConnectionInfo = new ConnectionInfo(version, salt);
             _isConnected = true;
+            ReadPacketAsync().FireAndForget();
             return ConnectionInfo;
+        }
+
+        private async Task ReadPacketAsync()
+        {
+            await _readerSemaphore.WaitAsync();
+            try
+            {
+                var sizePacket = await _sizeDeserializer.DeserializeAsync(_writeStream, CancellationToken.None);
+                if (sizePacket.DeserializedBytes < 5)
+                {
+                    await _readStream.ReadAsync(_readSizeEmptyBuffer, 0, 5 - sizePacket.DeserializedBytes);
+                }
+                var fullSize = sizePacket.Value;
+                var header = await _headerDeserializer.DeserializeAsync(_writeStream, CancellationToken.None);
+                var result = new ResponseContinuationResult(fullSize, header.DeserializedBytes, header.Value, _readerSemaphore);
+                if (_continuations.TryGetValue(header.Value.Sync, out var cts))
+                {
+                    cts.SetResult(result);
+                }
+            }
+            catch
+            {
+                //TODO exception
+                _readerSemaphore.Release();
+            }
+            
         }
 
         public async Task<AuthenticationInfo> AuthenticateAsync(string userName, string password, CancellationToken ct)
@@ -162,7 +208,7 @@ namespace Tarantool.Net.Driver
         {
             if (result.Header.ErrorCode.HasValue)
             {
-                var tarantoolError = await _errorDeserializer.DeserializeAsync(_stream, ct);
+                var tarantoolError = await _errorDeserializer.DeserializeAsync(_writeStream, ct);
                 throw new TarantoolException(result.Header.ErrorCode.Value, tarantoolError.Value.Message);
             }
         }
@@ -173,7 +219,7 @@ namespace Tarantool.Net.Driver
             while (unreaded != 0)
             {
                 var needReadBytes = unreaded < _emptyBuffer.Length ? unreaded : _emptyBuffer.Length;
-                unreaded -= await _stream.ReadAsync(_emptyBuffer, 0, needReadBytes);
+                unreaded -= await _readStream.ReadAsync(_emptyBuffer, 0, needReadBytes);
             }
         }
         private async Task ReadResponse(ResponseContinuationResult result, CancellationToken ct)
@@ -185,8 +231,7 @@ namespace Tarantool.Net.Driver
         private async Task<T> ReadResponse<T>(ResponseContinuationResult result, CancellationToken ct)
         {
             await EnsureSuccessResponse(result, ct);
-            var res = await _deserializerResolver.Resolve<T>().DeserializeAsync(_stream, ct);
-            await ReadToEndResponse(result, res.DeserializedBytes, ct);
+            var res = await _deserializerResolver.Resolve<T>().DeserializeAsync(_writeStream, ct);
             return res.Value;
         }
 
@@ -203,15 +248,15 @@ namespace Tarantool.Net.Driver
             var bodyBytes = await _serializerResolver.Resolve<TRequest>().SerializeAsync(bufferStream, request, ct).ConfigureAwait(false);
             await _sizeSerializer.SerializeAsync(bufferStream, headerBytes + bodyBytes, ct).ConfigureAwait(false);
 
-            await _semaphore.WaitAsync().ConfigureAwait(false);
+            await _readerSemaphore.WaitAsync(ct).ConfigureAwait(false);
             bufferStream.Position = 0;
             try
             {
-                await _stream.WriteAsync(buffer, 0, 5 + headerBytes + bodyBytes, ct).ConfigureAwait(false);
+                await _writeStream.WriteAsync(buffer, 0, 5 + headerBytes + bodyBytes, ct).ConfigureAwait(false);
             }
             finally
             {
-                _semaphore.Release();
+                _readerSemaphore.Release();
             }
             return responseTask;
         }
@@ -223,7 +268,7 @@ namespace Tarantool.Net.Driver
 
         public void Dispose()
         {
-            _stream?.Dispose();
+            _writeStream?.Dispose();
             _socket?.Dispose();
         }
 
@@ -238,11 +283,15 @@ namespace Tarantool.Net.Driver
         [NotNull] private readonly ConcurrentDictionary<ulong, TaskCompletionSource<ResponseContinuationResult>> _continuations =
             new ConcurrentDictionary<ulong, TaskCompletionSource<ResponseContinuationResult>>();
 
-        [NotNull] private readonly SemaphoreSlim _semaphore;
+        [NotNull] private readonly SemaphoreSlim _readerSemaphore;
         [NotNull] private readonly ISerializer<Header> _headerSerializer;
         [NotNull] private readonly ISerializer<int> _sizeSerializer;
         [NotNull] private readonly IDeserializer<ErrorResponse> _errorDeserializer;
         [NotNull] private readonly byte[] _emptyBuffer;
+        [NotNull] private readonly IDeserializer<Header> _headerDeserializer;
+        [NotNull] private readonly IDeserializer<int> _sizeDeserializer;
+        [NotNull] private readonly byte[] _readSizeEmptyBuffer;
+        [NotNull] private readonly SemaphoreSlim _writerSemaphore;
 
         private Task<ResponseContinuationResult> GetResponseTask(ulong sync)
         {
