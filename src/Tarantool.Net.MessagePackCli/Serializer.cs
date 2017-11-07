@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -12,27 +13,17 @@ using Tarantool.Net.Driver.Serialization;
 
 namespace Tarantool.Net.MessagePackCli
 {
-    public class Serializer<T> : ISerializer<T>
+    public class SerializerDeserializer<T> : ISerializer<T>, IDeserializer<T>
     {
         [NotNull] private readonly MessagePackSerializer<T> _messagePackSerializer;
 
-        public Serializer([NotNull] MessagePackSerializer<T> messagePackSerializer)
+        public SerializerDeserializer([NotNull] MessagePackSerializer<T> messagePackSerializer)
         {
             _messagePackSerializer = messagePackSerializer ?? throw new ArgumentNullException(nameof(messagePackSerializer));
         }
         public Task SerializeAsync(Stream s, T value, CancellationToken ct)
         {
             return _messagePackSerializer.PackAsync(s, value, ct);
-        }
-    }
-
-    public class Deserializer<T> : IDeserializer<T>
-    {
-        [NotNull] private readonly MessagePackSerializer<T> _messagePackSerializer;
-
-        public Deserializer([NotNull] MessagePackSerializer<T> messagePackSerializer)
-        {
-            _messagePackSerializer = messagePackSerializer ?? throw new ArgumentNullException(nameof(messagePackSerializer));
         }
 
         public Task<T> DeserializeAsync(Stream s, CancellationToken ct)
@@ -41,88 +32,33 @@ namespace Tarantool.Net.MessagePackCli
         }
     }
 
-    public class MessagePackResolver : ISerializerResolver, IDeserializerResolver
+    public class MapSerializerDeserializer<T> : IDeserializer<T>, ISerializer<T>
     {
-        [NotNull] private readonly SerializationContext _ctx;
+        [NotNull]
+        public SerializationContext OwnerContext { get; }
 
-        public MessagePackResolver()
+        public MapSerializerDeserializer([NotNull] SerializationContext ownerContext)
         {
-            _ctx = new SerializationContext();
-            _ctx.EnumSerializationOptions.SerializationMethod = EnumSerializationMethod.ByUnderlyingValue;
-            _ctx.Serializers.Register(new TarantoolMapSerializer<Header>(_ctx));
-            _ctx.Serializers.Register(new TarantoolMapSerializer<ErrorResponse>(_ctx));
-            _ctx.Serializers.Register(new TarantoolMapSerializer<AuthenticationInfo>(_ctx));
-        }
-        ISerializer<T> ISerializerResolver.Resolve<T>()
-        {
-            return new Serializer<T>(_ctx.GetSerializer<T>());
+            OwnerContext = ownerContext ?? throw new ArgumentNullException(nameof(ownerContext));
         }
 
-        IDeserializer<T> IDeserializerResolver.Resolve<T>()
+        public async Task<T> DeserializeAsync(Stream s, CancellationToken ct)
         {
-            return new Deserializer<T>(_ctx.GetSerializer<T>());
-        }
-    }
-
-    public class TarantoolMapSerializer<T> : MessagePackSerializer<T>
-    {
-        public TarantoolMapSerializer(SerializationContext ownerContext) : base(ownerContext)
-        {
-            //var valueTuples = typeof(T)
-            //    .GetProperties()
-            //    .Select(x => (Prop: x, Attr:x.GetCustomAttribute<TarantoolMapPairAttribute>()))
-            //    .Where(x => x.Attr != null);
-            //var getterParam = Expression.Parameter(typeof(T));
-            //var packerParam = Expression.Parameter(typeof(Packer));
-            //var ctParam = Expression.Parameter(typeof(CancellationToken));
-            //Expression<Func<SerializationContext>> ownerContextLambda = () => OwnerContext;
-            //var ownerContextExp = ownerContextLambda.Body;
-            //Expression<Func<SerializationContext>> ownerContextLambda = () => OwnerContext;
-
-            //foreach (var valueTuple in valueTuples)
-            //{
-            //    var me = Expression.Property(getterParam, valueTuple.Prop);
-
-            //    var getter = Expression.Lambda<Func<Packer, T, CancellationToken>>()
-            //}
-
-        }
-
-        protected override void PackToCore(Packer packer, T objectTree)
-        {
-            PackToAsyncCore(packer, objectTree, CancellationToken.None).Wait();
-        }
-
-        protected override T UnpackFromCore(Unpacker unpacker)
-        {
-            return UnpackFromAsyncCore(unpacker, CancellationToken.None).Result;
-        }
-
-        protected override async Task PackToAsyncCore(Packer packer, T objectTree, CancellationToken cancellationToken)
-        {
-            var valueTuples = objectTree
-                .GetType()
-                .GetProperties()
-                .Select(x => (x, x.GetCustomAttribute<MapKeyAttribute>()))
-                .Where(x => x.Item2 != null)
-                .Select(x => new
-                {
-                    Prop = x.Item1,
-                    Attr = x.Item2,
-                    Val = x.Item1.GetValue(objectTree)
-                })
-                .Where(x => x.Val != null)
-                .ToList();
-            await packer.PackMapHeaderAsync(valueTuples.Count, cancellationToken);
-            var keySerializer = OwnerContext.GetSerializer<Key>();
-            foreach (var valueTuple in valueTuples)
+            var unpacker = Unpacker.Create(s,
+                new PackerUnpackerStreamOptions() {OwnsStream = false, WithBuffering = false},
+                new UnpackerOptions {ValidationLevel = UnpackerValidationLevel.None});
+            if (!(await unpacker.ReadAsync(ct)))
             {
-                await keySerializer.PackToAsync(packer, valueTuple.Attr.Key, cancellationToken);
-                await OwnerContext.GetSerializer(valueTuple.Prop.PropertyType).PackToAsync(packer, valueTuple.Val, cancellationToken);
+                throw new InvalidOperationException();
             }
+            if (unpacker.LastReadData.IsNil)
+            {
+                throw new InvalidOperationException("null");
+            }
+            return await UnpackFromAsyncCore(unpacker, ct);
         }
 
-        protected override async Task<T> UnpackFromAsyncCore(Unpacker unpacker, CancellationToken cancellationToken)
+        private async Task<T> UnpackFromAsyncCore(Unpacker unpacker, CancellationToken cancellationToken)
         {
             var valueTuples = typeof(T).GetProperties().Select(x => (x, x.GetCustomAttribute<MapKeyAttribute>())).Where(x => x.Item2 != null).ToList();
             long mapLength;
@@ -147,7 +83,96 @@ namespace Tarantool.Net.MessagePackCli
             }
             return res;
         }
+
+        private async Task PackToAsyncCore(Packer packer, T objectTree, CancellationToken cancellationToken)
+        {
+            var valueTuples = objectTree
+                    .GetType()
+                    .GetProperties()
+                    .Select(x => (x, x.GetCustomAttribute<MapKeyAttribute>()))
+                    .Where(x => x.Item2 != null)
+                    .Select(x => new
+                    {
+                        Prop = x.Item1,
+                        Attr = x.Item2,
+                        Val = x.Item1.GetValue(objectTree)
+                    })
+                    .Where(x => x.Val != null)
+                    .ToList();
+            await packer.PackMapHeaderAsync(valueTuples.Count, cancellationToken);
+            var keySerializer = OwnerContext.GetSerializer<Key>();
+            foreach (var valueTuple in valueTuples)
+            {
+                await keySerializer.PackToAsync(packer, valueTuple.Attr.Key, cancellationToken);
+                await OwnerContext.GetSerializer(valueTuple.Prop.PropertyType).PackToAsync(packer, valueTuple.Val, cancellationToken);
+            }
+        }
+
+        /// <inheritdoc />
+        public async Task SerializeAsync(Stream s, T value, CancellationToken ct)
+        {
+            
+            var packer = Packer.Create(s, PackerCompatibilityOptions.None, false);
+            if (value == null)
+            {
+                // ReSharper disable once PossibleNullReferenceException
+                await packer.PackNullAsync(ct).ConfigureAwait(false);
+                return;
+            }
+            await PackToAsyncCore(packer, value, ct).ConfigureAwait(false);
+            if (s is MemoryStream ms)
+            { 
+                var arr = ms.ToArray();
+                var pos = ms.Position;
+                ms.Seek(5, SeekOrigin.Begin);
+                var up = Unpacker.Create(ms, false);
+                var h = up.ReadItemData();
+                var b = up.ReadItemData();
+                ms.Position = pos;
+            }
+        }
     }
+
+    public class MessagePackResolver : ISerializerResolver, IDeserializerResolver
+    {
+        [NotNull] private readonly SerializationContext _ctx;
+        [NotNull] private readonly Dictionary<Type, object> _internalMapSerializers = new Dictionary<Type, object>();
+
+        public MessagePackResolver()
+        {
+            _ctx = new SerializationContext();
+            _ctx.EnumSerializationOptions.SerializationMethod = EnumSerializationMethod.ByUnderlyingValue;
+            Add<Header>();
+            Add<ErrorResponse>();
+            Add<AuthenticationInfo>();
+        }
+
+        ISerializer<T> ISerializerResolver.Resolve<T>()
+        {
+            if (_internalMapSerializers.TryGetValue(typeof(T), out var res))
+            {
+                return (ISerializer<T>)res;
+            }
+            var messagePackSerializer = _ctx.GetSerializer<T>();
+            return new SerializerDeserializer<T>(messagePackSerializer);
+        }
+
+        IDeserializer<T> IDeserializerResolver.Resolve<T>()
+        {
+            if (_internalMapSerializers.TryGetValue(typeof(T), out var res))
+            {
+                return (IDeserializer<T>)res;
+            }
+            var messagePackSerializer = _ctx.GetSerializer<T>();
+            return new SerializerDeserializer<T>(messagePackSerializer);
+        }
+
+        private void Add<T>()
+        {
+            _internalMapSerializers.Add(typeof(T), new MapSerializerDeserializer<T>(_ctx));
+        }
+    }
+
     public static class AsyncReadResultExtensions
     {
         public static T ThrowIfUnsuccess<T>(this AsyncReadResult<T> readResult)

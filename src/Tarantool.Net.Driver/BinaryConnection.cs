@@ -25,7 +25,7 @@ namespace Tarantool.Net.Driver
 
         [NotNull] private readonly SemaphoreSlim _writerSemaphore;
         [NotNull] private readonly SemaphoreSlim _readerSemaphore;
-        [NotNull] private readonly byte[] _readSizeEmptyBuffer;
+        [NotNull] private readonly byte[] _readSizeBuffer;
         [NotNull] private StreamInformer _readStream;
         [NotNull] private Stream _writeStream;
         [NotNull] private NetworkStream _networkStream;
@@ -37,6 +37,7 @@ namespace Tarantool.Net.Driver
         private bool _isConnected;
 
         private long _syncCounter;
+        [NotNull] private readonly MemoryStream _readSizeStream;
 
         public BinaryConnection(
                 [NotNull] ISerializerResolver serializerResolver,
@@ -55,7 +56,8 @@ namespace Tarantool.Net.Driver
             _sizeDeserializer = deserializerResolver.Resolve<int>();
             _errorDeserializer = _deserializerResolver.Resolve<ErrorResponse>();
             _emptyBuffer = new byte[1024 * 16];
-            _readSizeEmptyBuffer = new byte[8];
+            _readSizeBuffer = new byte[8];
+            _readSizeStream = new MemoryStream(_readSizeBuffer);
         }
 
         public ConnectionInfo ConnectionInfo { get; private set; }
@@ -99,9 +101,10 @@ namespace Tarantool.Net.Driver
                 return AuthenticationInfo;
             }
             var buffer = new byte[40];
+            byte[] step1;
             using (var sha1 = SHA1.Create())
             {
-                var step1 = sha1.ComputeHash(Encoding.UTF8.GetBytes(password));
+                step1 = sha1.ComputeHash(Encoding.UTF8.GetBytes(password));
                 var step2 = sha1.ComputeHash(step1);
                 Array.Copy(ConnectionInfo.Salt, buffer, 20);
                 Array.Copy(step2, 0, buffer, 20, 20);
@@ -109,10 +112,10 @@ namespace Tarantool.Net.Driver
 
                 for (var i = 0; i < step1.Length; i++)
                 {
-                    buffer[i] = (byte) (step1[i] ^ step3[i]);
+                    step1[i] ^= step3[i];
                 }
             }
-            var authenticationInfo = new AuthenticationInfo(userName, buffer);
+            var authenticationInfo = new AuthenticationInfo(userName, step1);
             var responseTask = await SendRequestAsync(RequestType.Auth, null, authenticationInfo, ct);
             using (var result = await responseTask)
             {
@@ -140,11 +143,13 @@ namespace Tarantool.Net.Driver
             try
             {
                 _readStream.ClearState();
-                var sizePacket = await _sizeDeserializer.DeserializeAsync(_readStream, CancellationToken.None);
-                if (_readStream.ReadedBytes < 5)
+                var readedBytes = await _readStream.ReadAsync(_readSizeBuffer, 0, 5);
+                if (readedBytes != 5)
                 {
-                    await _readStream.ReadAsync(_readSizeEmptyBuffer, 0, 5 - _readStream.ReadedBytes);
+                    throw new InvalidOperationException("Could not read a packet size");
                 }
+                var sizePacket = await _sizeDeserializer.DeserializeAsync(_readSizeStream, CancellationToken.None);
+                
                 var fullSize = sizePacket;
                 var header = await _headerDeserializer.DeserializeAsync(_readStream, CancellationToken.None);
                 var headerSize = _readStream.ReadedBytes - 5;
@@ -153,11 +158,20 @@ namespace Tarantool.Net.Driver
                 {
                     cts.SetResult(result);
                 }
+                else
+                {
+                    //TODO if not exists continuation by sync
+                    _readerSemaphore.Release();
+                }
             }
             catch
             {
                 //TODO exception
                 _readerSemaphore.Release();
+            }
+            finally
+            {
+                ReadPacketAsync().FireAndForget();
             }
         }
 
