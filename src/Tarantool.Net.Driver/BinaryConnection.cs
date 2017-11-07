@@ -23,20 +23,20 @@ namespace Tarantool.Net.Driver
         [NotNull] private readonly IDeserializer<Header> _headerDeserializer;
         [NotNull] private readonly ISerializer<Header> _headerSerializer;
 
+        [NotNull] private readonly SemaphoreSlim _writerSemaphore;
         [NotNull] private readonly SemaphoreSlim _readerSemaphore;
         [NotNull] private readonly byte[] _readSizeEmptyBuffer;
-        [NotNull] private readonly StreamInformer _readStream;
+        [NotNull] private StreamInformer _readStream;
+        [NotNull] private Stream _writeStream;
+        [NotNull] private NetworkStream _networkStream;
         [NotNull] private readonly ISerializerResolver _serializerResolver;
         [NotNull] private readonly IDeserializer<int> _sizeDeserializer;
         [NotNull] private readonly ISerializer<int> _sizeSerializer;
         [NotNull] private readonly Socket _socket;
-        [NotNull] private readonly SemaphoreSlim _writerSemaphore;
-        [NotNull] private readonly Stream _writeStream;
         private bool _isAuthenticated;
         private bool _isConnected;
 
         private long _syncCounter;
-        [NotNull] private readonly NetworkStream _networkStream;
 
         public BinaryConnection(
                 [NotNull] ISerializerResolver serializerResolver,
@@ -46,8 +46,7 @@ namespace Tarantool.Net.Driver
             _serializerResolver = serializerResolver ?? throw new ArgumentNullException(nameof(serializerResolver));
             _deserializerResolver = deserializerResolver ?? throw new ArgumentNullException(nameof(deserializerResolver));
             _socket = new Socket(SocketType.Stream, ProtocolType.IP);
-            _networkStream = new NetworkStream(_socket, true);
-            _writeStream =_networkStream;
+
             _readerSemaphore = new SemaphoreSlim(1);
             _writerSemaphore = new SemaphoreSlim(1);
             _headerSerializer = serializerResolver.Resolve<Header>();
@@ -57,7 +56,6 @@ namespace Tarantool.Net.Driver
             _errorDeserializer = _deserializerResolver.Resolve<ErrorResponse>();
             _emptyBuffer = new byte[1024 * 16];
             _readSizeEmptyBuffer = new byte[8];
-            _readStream = new StreamInformer(new BufferedStream(_networkStream, 1024 * 16));
         }
 
         public ConnectionInfo ConnectionInfo { get; private set; }
@@ -70,12 +68,22 @@ namespace Tarantool.Net.Driver
                 return ConnectionInfo;
             }
             await _socket.ConnectAsync(host, port);
+            _networkStream = new NetworkStream(_socket, true);
+            _writeStream = _networkStream;
+            _readStream = new StreamInformer(new BufferedStream(_networkStream, 1024 * 16));
+
             var buffer = new byte[128];
+            var readed = await _readStream.ReadAsync(buffer, 0, buffer.Length);
+            if (readed != buffer.Length)
+            {
+                throw new InvalidOperationException($"Invalid greeting message. Expected 128 bytes, actual {readed} bytes");
+            }
             var version = Encoding.ASCII.GetString(buffer, 0, 63);
-            var saltBase64 = Encoding.ASCII.GetString(buffer, 64, 44);
+            var saltBase64 = Encoding.ASCII.GetString(buffer, 64, 63);
             var salt = Convert.FromBase64String(saltBase64);
             ConnectionInfo = new ConnectionInfo(version, salt);
             _isConnected = true;
+
             ReadPacketAsync().FireAndForget();
             return ConnectionInfo;
         }
@@ -198,20 +206,20 @@ namespace Tarantool.Net.Driver
             var sync = NextSync();
             var responseTask = GetResponseTask(sync);
             var header = new Header(requestType, sync, schemaId);
-            var buffer = new byte[5 + 13];
-            var bufferStream = new MemoryStream(buffer);
+            var bufferStream = new MemoryStream(5+13);
             bufferStream.Seek(5, SeekOrigin.Begin);
             await _headerSerializer.SerializeAsync(bufferStream, header, ct).ConfigureAwait(false);
             await _serializerResolver.Resolve<TRequest>().SerializeAsync(bufferStream, request, ct).ConfigureAwait(false);
             var headerAndBodySize = (int)bufferStream.Position - 5;
             bufferStream.Position = 0;
             await _sizeSerializer.SerializeAsync(bufferStream, headerAndBodySize, ct).ConfigureAwait(false);
+            bufferStream.Position = 0;
 
             await _writerSemaphore.WaitAsync(ct).ConfigureAwait(false);
-            bufferStream.Position = 0;
             try
             {
-                await _writeStream.WriteAsync(buffer, 0, (int)bufferStream.Length, ct).ConfigureAwait(false);
+                await bufferStream.CopyToAsync(_writeStream, 81920, ct);
+                //await _writeStream.WriteAsync(buffer, 0, (int)bufferStream.Length, ct).ConfigureAwait(false);
             }
             finally
             {

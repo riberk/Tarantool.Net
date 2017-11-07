@@ -1,12 +1,10 @@
-﻿namespace Tarantool.Net.Driver
-{
-    public struct ErrorResponse
-    {
-        public ErrorResponse(string message)
-        {
-            Message = message;
-        }
+﻿using Tarantool.Net.Driver.Serialization;
 
-        public string Message { get; }
+namespace Tarantool.Net.Driver
+{
+    public class ErrorResponse
+    {
+        [MapKey(Key.Error)]
+        public string Message { get; set; }
     }
 }

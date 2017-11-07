@@ -2,7 +2,7 @@
 
 namespace Tarantool.Net.Driver
 {
-    public struct ConnectionInfo
+    public class ConnectionInfo
     {
         /// <summary>Initializes a new instance of the <see cref="T:System.Object"></see> class.</summary>
         public ConnectionInfo(string version, byte[] salt)

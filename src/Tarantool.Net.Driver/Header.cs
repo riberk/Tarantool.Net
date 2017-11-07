@@ -1,28 +1,32 @@
-﻿namespace Tarantool.Net.Driver
+﻿using Tarantool.Net.Driver.Serialization;
+
+namespace Tarantool.Net.Driver
 {
-    public struct Header
+    public class Header
     {
-        public Header(RequestType requestType, ulong sync) : this(requestType, sync, null)
+        public Header()
         {
         }
 
-        public Header(RequestType requestType, ulong sync, uint? schemaId)
+        public Header(RequestType requestType, ulong sync, uint? schemaVersion)
         {
             RequestType = requestType;
             Sync = sync;
-            SchemaId = schemaId;
-            ErrorCode = (RequestType & RequestType.TypeError) == RequestType.TypeError
-                            ? (ErrorCode) (RequestType ^ RequestType.TypeError)
-                            : (ErrorCode?) null;
+            SchemaVersion = schemaVersion;
         }
 
-        public RequestType RequestType { get; }
+        [MapKey(Key.RequestType)]
+        public RequestType RequestType { get; set; }
 
-        public ulong Sync { get; }
+        [MapKey(Key.Sync)]
+        public ulong Sync { get; set; }
 
-        public uint? SchemaId { get; }
+        [MapKey(Key.SchemaVersion)]
+        public uint? SchemaVersion { get; set; }
 
-        public ErrorCode? ErrorCode { get; }
+        public ErrorCode? ErrorCode => (RequestType & RequestType.TypeError) == RequestType.TypeError
+                                           ? (ErrorCode)(RequestType ^ RequestType.TypeError)
+                                           : (ErrorCode?)null;
 
         public bool HasError => ErrorCode.HasValue;
     }
