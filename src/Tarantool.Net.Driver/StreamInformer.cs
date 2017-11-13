@@ -45,9 +45,10 @@ namespace Tarantool.Net.Driver
             return readed;
         }
 
+        [NotNull]
         public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
         {
-            var readed = await base.ReadAsync(buffer, offset, count, cancellationToken);
+            var readed = await _baseStream.ReadAsync(buffer, offset, count, cancellationToken);
             _currentState.Readed += readed;
             return readed;
         }

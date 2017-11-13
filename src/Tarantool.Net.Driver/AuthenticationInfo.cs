@@ -7,11 +7,11 @@ namespace Tarantool.Net.Driver
     public class AuthenticationInfo
     {
         /// <summary>Initializes a new instance of the <see cref="T:System.Object"></see> class.</summary>
-        public AuthenticationInfo(string userName, [NotNull] byte[] chapSha1)
+        public AuthenticationInfo(string userName, string method, [NotNull] byte[] value)
         {
-            if (chapSha1 == null) throw new ArgumentNullException(nameof(chapSha1));
+            if (value == null) throw new ArgumentNullException(nameof(value));
             UserName = userName ?? throw new ArgumentNullException(nameof(userName));
-            Auth = ("chap-sha1", chapSha1);
+            Auth = ("chap-sha1", value);
         }
 
         [MapKey(Key.Tuple)]

@@ -32,6 +32,41 @@ namespace Tarantool.Net.MessagePackCli
         }
     }
 
+    public class MessagePackStructureReader : IMessagePackStructureReader
+    {
+        [NotNull] private readonly Unpacker _unpacker;
+
+        public MessagePackStructureReader([NotNull] Unpacker unpacker)
+        {
+            _unpacker = unpacker ?? throw new ArgumentNullException(nameof(unpacker));
+        }
+        public Task<long> ReadMapHeader(CancellationToken ct) => ReadHeader(ct, unpacker => unpacker.IsMapHeader, "map header");
+
+        public Task<long> ReadArrayHeader(CancellationToken ct) => ReadHeader(ct, unpacker => unpacker.IsArrayHeader, "array header");
+        public async Task<int> ReadInt(CancellationToken ct)
+        {
+            if (!await _unpacker.ReadAsync(ct).ConfigureAwait(false))
+            {
+                throw new TarantoolProtocolException("Could not read from stream");
+            }
+            return _unpacker.LastReadData.AsInt32();
+        }
+
+        private async Task<long> ReadHeader(CancellationToken ct, [NotNull] Func<Unpacker, bool> isHeader, string expectedSymbol)
+        {
+            if (!await _unpacker.ReadAsync(ct).ConfigureAwait(false))
+            {
+                throw new TarantoolProtocolException("Could not read from stream");
+            }
+
+            if (!isHeader(_unpacker))
+            {
+                throw new TarantoolProtocolException($"Expected symbol is {expectedSymbol}, but {_unpacker.LastReadData}");
+            }
+            return _unpacker.LastReadData.AsInt64();
+        }
+    }
+
     public class MapSerializerDeserializer<T> : IDeserializer<T>, ISerializer<T>
     {
         [NotNull]
@@ -120,20 +155,10 @@ namespace Tarantool.Net.MessagePackCli
                 return;
             }
             await PackToAsyncCore(packer, value, ct).ConfigureAwait(false);
-            if (s is MemoryStream ms)
-            { 
-                var arr = ms.ToArray();
-                var pos = ms.Position;
-                ms.Seek(5, SeekOrigin.Begin);
-                var up = Unpacker.Create(ms, false);
-                var h = up.ReadItemData();
-                var b = up.ReadItemData();
-                ms.Position = pos;
-            }
         }
     }
 
-    public class MessagePackResolver : ISerializerResolver, IDeserializerResolver
+    public class MessagePackResolver : ISerializerResolver, IDeserializerResolver, IMessagePackStructureReaderFactory
     {
         [NotNull] private readonly SerializationContext _ctx;
         [NotNull] private readonly Dictionary<Type, object> _internalMapSerializers = new Dictionary<Type, object>();
@@ -145,6 +170,10 @@ namespace Tarantool.Net.MessagePackCli
             Add<Header>();
             Add<ErrorResponse>();
             Add<AuthenticationInfo>();
+            Add<SelectRequest<int>>();
+            Add<SelectRequest<ValueTuple<int>>>();
+            Add<SelectRequest<Tuple<int>>>();
+            Add<SelectRequest<int[]>>();
         }
 
         ISerializer<T> ISerializerResolver.Resolve<T>()
@@ -170,6 +199,15 @@ namespace Tarantool.Net.MessagePackCli
         private void Add<T>()
         {
             _internalMapSerializers.Add(typeof(T), new MapSerializerDeserializer<T>(_ctx));
+        }
+
+        public Task<IMessagePackStructureReader> Create(Stream s, Guid connectionId, CancellationToken ct)
+        {
+            var unpacker = Unpacker.Create(s,
+                                           new PackerUnpackerStreamOptions() {OwnsStream = false, WithBuffering = false},
+                                           new UnpackerOptions {ValidationLevel = UnpackerValidationLevel.None});
+            IMessagePackStructureReader res = new MessagePackStructureReader(unpacker);
+            return Task.FromResult(res);
         }
     }
 

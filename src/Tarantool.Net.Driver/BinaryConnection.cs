@@ -2,8 +2,8 @@
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net.Sockets;
-using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -14,56 +14,54 @@ namespace Tarantool.Net.Driver
 {
     public class BinaryConnection : IBinaryConnection
     {
-        [NotNull] private readonly ConcurrentDictionary<ulong, TaskCompletionSource<ResponseContinuationResult>> _continuations =
-            new ConcurrentDictionary<ulong, TaskCompletionSource<ResponseContinuationResult>>();
-
         [NotNull] private readonly IDeserializerResolver _deserializerResolver;
-        [NotNull] private readonly byte[] _emptyBuffer;
-        [NotNull] private readonly IDeserializer<ErrorResponse> _errorDeserializer;
-        [NotNull] private readonly IDeserializer<Header> _headerDeserializer;
+        [NotNull] private readonly IMessagePackStructureReaderFactory _messagePackStructureReaderFactory;
+        [NotNull] private readonly IAuthenticationInfoFactory _authenticationInfoFactory;
+        [NotNull] private readonly IReaderFactory _readerFactory;
+
+        [NotNull] private readonly ConcurrentDictionary<ulong, TaskCompletionSource<ResponseInfo>> _continuations =
+            new ConcurrentDictionary<ulong, TaskCompletionSource<ResponseInfo>>();
+
         [NotNull] private readonly ISerializer<Header> _headerSerializer;
 
         [NotNull] private readonly SemaphoreSlim _writerSemaphore;
-        [NotNull] private readonly SemaphoreSlim _readerSemaphore;
-        [NotNull] private readonly byte[] _readSizeBuffer;
-        [NotNull] private StreamInformer _readStream;
         [NotNull] private Stream _writeStream;
         [NotNull] private NetworkStream _networkStream;
         [NotNull] private readonly ISerializerResolver _serializerResolver;
-        [NotNull] private readonly IDeserializer<int> _sizeDeserializer;
         [NotNull] private readonly ISerializer<int> _sizeSerializer;
         [NotNull] private readonly Socket _socket;
         private bool _isAuthenticated;
         private bool _isConnected;
 
         private long _syncCounter;
-        [NotNull] private readonly MemoryStream _readSizeStream;
+        [NotNull] private IReader _reader;
 
         public BinaryConnection(
                 [NotNull] ISerializerResolver serializerResolver,
-                [NotNull] IDeserializerResolver deserializerResolver
+                [NotNull] IDeserializerResolver deserializerResolver,
+                [NotNull] IReaderFactory readerFactory,
+                [NotNull] IAuthenticationInfoFactory authenticationInfoFactory,
+                [NotNull] IMessagePackStructureReaderFactory messagePackStructureReaderFactory
             )
         {
+            _deserializerResolver = deserializerResolver;
+            _messagePackStructureReaderFactory = messagePackStructureReaderFactory ?? throw new ArgumentNullException(nameof(messagePackStructureReaderFactory));
+            _authenticationInfoFactory = authenticationInfoFactory ?? throw new ArgumentNullException(nameof(authenticationInfoFactory));
+            _readerFactory = readerFactory ?? throw new ArgumentNullException(nameof(readerFactory));
+            ConnectionId = Guid.NewGuid();
             _serializerResolver = serializerResolver ?? throw new ArgumentNullException(nameof(serializerResolver));
-            _deserializerResolver = deserializerResolver ?? throw new ArgumentNullException(nameof(deserializerResolver));
             _socket = new Socket(SocketType.Stream, ProtocolType.IP);
-
-            _readerSemaphore = new SemaphoreSlim(1);
             _writerSemaphore = new SemaphoreSlim(1);
             _headerSerializer = serializerResolver.Resolve<Header>();
-            _headerDeserializer = deserializerResolver.Resolve<Header>();
             _sizeSerializer = serializerResolver.Resolve<int>();
-            _sizeDeserializer = deserializerResolver.Resolve<int>();
-            _errorDeserializer = _deserializerResolver.Resolve<ErrorResponse>();
-            _emptyBuffer = new byte[1024 * 16];
-            _readSizeBuffer = new byte[8];
-            _readSizeStream = new MemoryStream(_readSizeBuffer);
         }
+
+        public Guid ConnectionId { get; }
 
         public ConnectionInfo ConnectionInfo { get; private set; }
         public AuthenticationInfo AuthenticationInfo { get; private set; }
 
-        public async Task<ConnectionInfo> OpenAsync(string host, int port)
+        public async Task<ConnectionInfo> OpenAsync(string host, int port, CancellationToken ct)
         {
             if (_isConnected)
             {
@@ -72,20 +70,9 @@ namespace Tarantool.Net.Driver
             await _socket.ConnectAsync(host, port);
             _networkStream = new NetworkStream(_socket, true);
             _writeStream = _networkStream;
-            _readStream = new StreamInformer(new BufferedStream(_networkStream, 1024 * 16));
-
-            var buffer = new byte[128];
-            var readed = await _readStream.ReadAsync(buffer, 0, buffer.Length);
-            if (readed != buffer.Length)
-            {
-                throw new InvalidOperationException($"Invalid greeting message. Expected 128 bytes, actual {readed} bytes");
-            }
-            var version = Encoding.ASCII.GetString(buffer, 0, 63);
-            var saltBase64 = Encoding.ASCII.GetString(buffer, 64, 63);
-            var salt = Convert.FromBase64String(saltBase64);
-            ConnectionInfo = new ConnectionInfo(version, salt);
+            _reader = await _readerFactory.CreateAsync(_networkStream, _deserializerResolver, _messagePackStructureReaderFactory, ConnectionId, ct);
+            ConnectionInfo = await _reader.ReadConnectionInfo(ct);
             _isConnected = true;
-
             ReadPacketAsync().FireAndForget();
             return ConnectionInfo;
         }
@@ -100,35 +87,24 @@ namespace Tarantool.Net.Driver
             {
                 return AuthenticationInfo;
             }
-            var buffer = new byte[40];
-            byte[] step1;
-            using (var sha1 = SHA1.Create())
-            {
-                step1 = sha1.ComputeHash(Encoding.UTF8.GetBytes(password));
-                var step2 = sha1.ComputeHash(step1);
-                Array.Copy(ConnectionInfo.Salt, buffer, 20);
-                Array.Copy(step2, 0, buffer, 20, 20);
-                var step3 = sha1.ComputeHash(buffer);
 
-                for (var i = 0; i < step1.Length; i++)
-                {
-                    step1[i] ^= step3[i];
-                }
-            }
-            var authenticationInfo = new AuthenticationInfo(userName, step1);
+            var salt = new ArraySegment<byte>(ConnectionInfo.Salt, 0, ConnectionInfo.Salt.Length);
+            var authenticationInfo = await _authenticationInfoFactory.Create(userName, password, salt);
             var responseTask = await SendRequestAsync(RequestType.Auth, null, authenticationInfo, ct);
             using (var result = await responseTask)
             {
-                await ReadResponse(result, ct);
+                await _reader.ReadBodyAsync(result, ct);
             }
             _isAuthenticated = true;
             AuthenticationInfo = authenticationInfo;
             return AuthenticationInfo;
         }
 
-        public Task<IAsyncEnumerable<TResult>> Select<TKey, TResult>(ISelectRequest<TKey> request, CancellationToken ct)
+        public async Task<IAsyncEnumerator<TResult>> Select<TKey, TResult>(SelectRequest<TKey> request, CancellationToken ct)
         {
-            throw new NotImplementedException();
+            var responseTask = await SendRequestAsync(RequestType.Select, null, request, ct);
+            var result = await responseTask;
+            return new SelectBodyEnumerator<TResult>(_deserializerResolver.Resolve<TResult>(), result, _reader);
         }
 
         public void Dispose()
@@ -139,35 +115,25 @@ namespace Tarantool.Net.Driver
 
         private async Task ReadPacketAsync()
         {
-            await _readerSemaphore.WaitAsync();
             try
             {
-                _readStream.ClearState();
-                var readedBytes = await _readStream.ReadAsync(_readSizeBuffer, 0, 5);
-                if (readedBytes != 5)
+                var result = await _reader.ReadNextAsync(CancellationToken.None);
+                if (_continuations.TryGetValue(result.Header.Sync, out var cts))
                 {
-                    throw new InvalidOperationException("Could not read a packet size");
-                }
-                var sizePacket = await _sizeDeserializer.DeserializeAsync(_readSizeStream, CancellationToken.None);
-                
-                var fullSize = sizePacket;
-                var header = await _headerDeserializer.DeserializeAsync(_readStream, CancellationToken.None);
-                var headerSize = _readStream.ReadedBytes - 5;
-                var result = new ResponseContinuationResult(fullSize, headerSize, header, _readerSemaphore);
-                if (_continuations.TryGetValue(header.Sync, out var cts))
-                {
-                    cts.SetResult(result);
+                    var error = await _reader.TryReadError(result, CancellationToken.None);
+                    if (error.HasValue)
+                    {
+                        cts.SetException(new TarantoolException(result.Header.ErrorCode.Value, error.Value?.Message));
+                    }
+                    else
+                    {
+                        cts.SetResult(result);
+                    }
                 }
                 else
                 {
                     //TODO if not exists continuation by sync
-                    _readerSemaphore.Release();
                 }
-            }
-            catch
-            {
-                //TODO exception
-                _readerSemaphore.Release();
             }
             finally
             {
@@ -175,43 +141,8 @@ namespace Tarantool.Net.Driver
             }
         }
 
-        private async Task EnsureSuccessResponse(ResponseContinuationResult result, CancellationToken ct)
-        {
-            if (result.Header.ErrorCode.HasValue)
-            {
-                var tarantoolError = await _errorDeserializer.DeserializeAsync(_readStream, ct);
-                throw new TarantoolException(result.Header.ErrorCode.Value, tarantoolError.Message);
-            }
-        }
-
-        private async Task ReadToEndResponse(ResponseContinuationResult result, int bodyReadedBytes, CancellationToken ct)
-        {
-            var unreaded = result.BodySize - bodyReadedBytes;
-            while (unreaded != 0)
-            {
-                var needReadBytes = unreaded < _emptyBuffer.Length ? unreaded : _emptyBuffer.Length;
-                unreaded -= await _readStream.ReadAsync(_emptyBuffer, 0, needReadBytes);
-            }
-        }
-
-        private async Task ReadResponse(ResponseContinuationResult result, CancellationToken ct)
-        {
-            await EnsureSuccessResponse(result, ct);
-            await ReadToEndResponse(result, 0, ct);
-        }
-
-        private async Task<T> ReadResponse<T>(ResponseContinuationResult result, CancellationToken ct)
-        {
-            await EnsureSuccessResponse(result, ct);
-            var beforeBytesReaded = _readStream.ReadedBytes;
-            var res = await _deserializerResolver.Resolve<T>().DeserializeAsync(_readStream, ct);
-            
-            await ReadToEndResponse(result, _readStream.ReadedBytes - beforeBytesReaded, ct);
-            return res;
-        }
-
         [ItemNotNull]
-        private async Task<Task<ResponseContinuationResult>> SendRequestAsync<TRequest>(
+        private async Task<Task<ResponseInfo>> SendRequestAsync<TRequest>(
             RequestType requestType,
             uint? schemaId,
             TRequest request,
@@ -227,13 +158,21 @@ namespace Tarantool.Net.Driver
             var headerAndBodySize = (int)bufferStream.Position - 5;
             bufferStream.Position = 0;
             await _sizeSerializer.SerializeAsync(bufferStream, headerAndBodySize, ct).ConfigureAwait(false);
+            var packetSizeBytes = (int)bufferStream.Position;
             bufferStream.Position = 0;
 
             await _writerSemaphore.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                await bufferStream.CopyToAsync(_writeStream, 81920, ct);
-                //await _writeStream.WriteAsync(buffer, 0, (int)bufferStream.Length, ct).ConfigureAwait(false);
+                var buffer = bufferStream.GetBuffer();
+                var ms = new MemoryStream();
+                await ms.WriteAsync(buffer, 0, packetSizeBytes, ct);
+                await ms.WriteAsync(buffer, 5, headerAndBodySize, ct);
+                var sb = new StringBuilder();
+                ms.ToArray().Aggregate(sb, (b, v) => b.Append(v.ToString("X2") + " "));
+                var str = sb.ToString();
+                await _writeStream.WriteAsync(buffer, 0, packetSizeBytes, ct);
+                await _writeStream.WriteAsync(buffer, 5, headerAndBodySize, ct);
             }
             finally
             {
@@ -248,9 +187,9 @@ namespace Tarantool.Net.Driver
             return (ulong) _syncCounter;
         }
 
-        private Task<ResponseContinuationResult> GetResponseTask(ulong sync)
+        private Task<ResponseInfo> GetResponseTask(ulong sync)
         {
-            var cs = new TaskCompletionSource<ResponseContinuationResult>();
+            var cs = new TaskCompletionSource<ResponseInfo>();
             if (!_continuations.TryAdd(sync, cs))
             {
                 throw new InvalidOperationException($"Continuation with sync - {sync} already added");
@@ -258,29 +197,69 @@ namespace Tarantool.Net.Driver
             return cs.Task;
         }
 
-        private struct ResponseContinuationResult : IDisposable
+        
+    }
+
+    internal class SelectBodyEnumerator<T> : IAsyncEnumerator<T>
+    {
+        [NotNull] private readonly IDeserializer<T> _deserializer;
+        private readonly ResponseInfo _responseInfo;
+        [NotNull] private readonly IReader _reader;
+        private int _count;
+        private int _current;
+
+        public SelectBodyEnumerator(
+            [NotNull] IDeserializer<T> deserializer,
+            ResponseInfo responseInfo,
+            [NotNull] IReader reader
+        )
         {
-            [NotNull] private readonly SemaphoreSlim _semaphore;
-
-            public ResponseContinuationResult(
-                int fullSize,
-                int headerSize,
-                Header header,
-                [NotNull] SemaphoreSlim semaphore)
-            {
-                _semaphore = semaphore ?? throw new ArgumentNullException(nameof(semaphore));
-                Header = header;
-                BodySize = fullSize - headerSize;
-            }
-
-            public Header Header { get; }
-
-            public int BodySize { get; }
-
-            public void Dispose()
-            {
-                _semaphore.Release();
-            }
+            _deserializer = deserializer ?? throw new ArgumentNullException(nameof(deserializer));
+            _responseInfo = responseInfo;
+            _reader = reader ?? throw new ArgumentNullException(nameof(reader));
+            _count = -1;
+            _current = 0;
         }
+        /// <inheritdoc />
+        public void Dispose() => _responseInfo.Dispose();
+
+        /// <inheritdoc />
+        public async Task<bool> MoveNext(CancellationToken cancellationToken)
+        {
+            if (_count == -1)
+            {
+                var ms = new MemoryStream();
+                await _reader.ReadBodyToAsync(_responseInfo, ms, cancellationToken);
+                var sb = new StringBuilder();
+                ms.ToArray().Aggregate(sb, (b, v) => b.Append(v.ToString("X2") + " "));
+                var str = sb.ToString();
+                var mapCount = await _reader.ReadMapHeader(cancellationToken);
+                if (mapCount != 1)
+                {
+                    throw new TarantoolProtocolException($"Expected data is map with one value, but values count is {mapCount}");
+                }
+                var val = (Key)await _reader.ReadInt(cancellationToken);
+                if (val != Key.Data)
+                {
+                    throw new TarantoolProtocolException($"Expected data key {Key.Data} but was {val}");
+                }
+                _count = await _reader.ReadArrayHeader(cancellationToken);
+            }
+
+            if(_count == 0)
+            {
+                return false;
+            }
+            if (_current == _count)
+            {
+                return false;
+            }
+            Current = await _reader.ReadAsync(_deserializer, cancellationToken);
+            _current++;
+            return true;
+        }
+
+        /// <inheritdoc />
+        public T Current { get; private set; }
     }
 }

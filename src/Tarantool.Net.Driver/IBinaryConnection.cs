@@ -11,10 +11,10 @@ namespace Tarantool.Net.Driver
 
         AuthenticationInfo AuthenticationInfo { get; }
 
-        Task<ConnectionInfo> OpenAsync(string host, int port);
+        Task<ConnectionInfo> OpenAsync(string host, int port, CancellationToken ct);
 
         Task<AuthenticationInfo> AuthenticateAsync(string userName, string password, CancellationToken ct);
 
-        Task<IAsyncEnumerable<TResult>> Select<TKey, TResult>(ISelectRequest<TKey> request, CancellationToken ct);
+        Task<IAsyncEnumerator<TResult>> Select<TKey, TResult>(SelectRequest<TKey> request, CancellationToken ct);
     }
 }
